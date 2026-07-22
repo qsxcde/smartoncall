@@ -89,3 +89,63 @@ async def test_register_code_deleted_after_use(auth_service, redis_client):
     )
     code = await redis_client.get("verify_code:reg3@example.com")
     assert code is None
+
+
+import bcrypt
+
+
+@pytest.mark.asyncio
+async def test_login_with_password_success(auth_service, db_session, redis_client):
+    password_hash = bcrypt.hashpw("correct".encode(), bcrypt.gensalt()).decode()
+    user = User(email="login@example.com", username="u", password_hash=password_hash)
+    db_session.add(user)
+    await db_session.commit()
+
+    from smartoncall.services.auth.schemas import TokenResponse
+    tokens = await auth_service.login_with_password("login@example.com", "correct")
+    assert isinstance(tokens, TokenResponse)
+    assert tokens.access_token
+    assert tokens.refresh_token
+
+    from smartoncall.services.auth.jwt import decode_token
+    payload = decode_token(tokens.refresh_token)
+    key = f"refresh_token:{payload['user_id']}:{payload['jti']}"
+    assert await redis_client.exists(key)
+
+
+@pytest.mark.asyncio
+async def test_login_with_password_wrong(auth_service, db_session, redis_client):
+    password_hash = bcrypt.hashpw("correct".encode(), bcrypt.gensalt()).decode()
+    user = User(email="fail@example.com", username="u", password_hash=password_hash)
+    db_session.add(user)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="邮箱或密码错误"):
+        await auth_service.login_with_password("fail@example.com", "wrong")
+
+    count = await redis_client.get("login_fail:fail@example.com")
+    assert count == "1"
+
+
+@pytest.mark.asyncio
+async def test_login_locked_after_max_attempts(auth_service, db_session, redis_client):
+    password_hash = bcrypt.hashpw("correct".encode(), bcrypt.gensalt()).decode()
+    user = User(email="locked@example.com", username="u", password_hash=password_hash)
+    db_session.add(user)
+    await db_session.commit()
+
+    await redis_client.set("login_fail:locked@example.com", "5", ex=900)
+
+    with pytest.raises(ValueError, match="登录尝试过多，请15分钟后再试"):
+        await auth_service.login_with_password("locked@example.com", "correct")
+
+
+@pytest.mark.asyncio
+async def test_login_inactive_user(auth_service, db_session):
+    password_hash = bcrypt.hashpw("pass".encode(), bcrypt.gensalt()).decode()
+    user = User(email="inactive@example.com", username="u", password_hash=password_hash, is_active=False)
+    db_session.add(user)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="账户已被禁用"):
+        await auth_service.login_with_password("inactive@example.com", "pass")

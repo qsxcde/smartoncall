@@ -54,3 +54,45 @@ class AuthService:
         await self.db.commit()
 
         logger.info("注册成功", email=email, username=username)
+
+    async def login_with_password(self, email: str, password: str) -> "TokenResponse":
+        from smartoncall.services.auth.schemas import TokenResponse
+        from smartoncall.services.auth.jwt import create_access_token, create_refresh_token
+
+        fail_key = f"login_fail:{email}"
+        fail_count = await self.redis.get(fail_key)
+        if fail_count and int(fail_count) >= self.settings.LOGIN_MAX_ATTEMPTS:
+            raise ValueError("登录尝试过多，请15分钟后再试")
+
+        result = await self.db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            await self.redis.incr(fail_key)
+            await self.redis.expire(fail_key, self.settings.LOGIN_LOCK_TTL)
+            logger.warning("登录失败，用户不存在", email=email)
+            raise ValueError("邮箱或密码错误")
+
+        if not user.is_active:
+            raise ValueError("账户已被禁用")
+
+        if not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
+            await self.redis.incr(fail_key)
+            await self.redis.expire(fail_key, self.settings.LOGIN_LOCK_TTL)
+            logger.warning("登录失败，密码错误", email=email)
+            raise ValueError("邮箱或密码错误")
+
+        await self.redis.delete(fail_key)
+
+        access_token = create_access_token(user_id=user.id, email=user.email)
+        refresh_token, jti = create_refresh_token(user_id=user.id)
+
+        refresh_key = f"refresh_token:{user.id}:{jti}"
+        await self.redis.set(
+            refresh_key,
+            "1",
+            ex=self.settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        )
+
+        logger.info("登录成功", user_id=user.id, email=user.email)
+        return TokenResponse(access_token=access_token, refresh_token=refresh_token)
