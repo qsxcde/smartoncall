@@ -149,3 +149,81 @@ async def test_login_inactive_user(auth_service, db_session):
 
     with pytest.raises(ValueError, match="账户已被禁用"):
         await auth_service.login_with_password("inactive@example.com", "pass")
+
+
+@pytest.mark.asyncio
+async def test_send_login_code_success(auth_service, db_session, redis_client):
+    user = User(email="code@example.com", username="u", password_hash="h")
+    db_session.add(user)
+    await db_session.commit()
+
+    await auth_service.send_login_code("code@example.com")
+    code = await redis_client.get("verify_code:code@example.com")
+    assert code is not None
+
+
+@pytest.mark.asyncio
+async def test_send_login_code_unregistered(auth_service):
+    with pytest.raises(ValueError, match="该邮箱未注册"):
+        await auth_service.send_login_code("nobody@example.com")
+
+
+@pytest.mark.asyncio
+async def test_login_with_code_success(auth_service, db_session, redis_client):
+    user = User(email="codelogin@example.com", username="u", password_hash="h")
+    db_session.add(user)
+    await db_session.commit()
+
+    await redis_client.set("verify_code:codelogin@example.com", "123456", ex=300)
+    tokens = await auth_service.login_with_code("codelogin@example.com", "123456")
+    assert tokens.access_token
+    assert tokens.refresh_token
+
+
+@pytest.mark.asyncio
+async def test_login_with_code_wrong(auth_service, db_session, redis_client):
+    user = User(email="codefail@example.com", username="u", password_hash="h")
+    db_session.add(user)
+    await db_session.commit()
+
+    await redis_client.set("verify_code:codefail@example.com", "111111", ex=300)
+    with pytest.raises(ValueError, match="验证码错误或已过期"):
+        await auth_service.login_with_code("codefail@example.com", "999999")
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_success(auth_service, db_session, redis_client):
+    user = User(email="refresh@example.com", username="u", password_hash="h")
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    from smartoncall.services.auth.jwt import create_refresh_token
+    token, jti = create_refresh_token(user_id=user.id)
+    await redis_client.set(f"refresh_token:{user.id}:{jti}", "1", ex=604800)
+
+    new_tokens = await auth_service.refresh_access_token(token)
+    assert new_tokens.access_token
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_revoked(auth_service, redis_client):
+    from smartoncall.services.auth.jwt import create_refresh_token
+    token, jti = create_refresh_token(user_id=999)
+    with pytest.raises(ValueError, match="登录已过期，请重新登录"):
+        await auth_service.refresh_access_token(token)
+
+
+@pytest.mark.asyncio
+async def test_logout(auth_service, db_session, redis_client):
+    user = User(email="logout@example.com", username="u", password_hash="h")
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    from smartoncall.services.auth.jwt import create_refresh_token
+    token, jti = create_refresh_token(user_id=user.id)
+    await redis_client.set(f"refresh_token:{user.id}:{jti}", "1", ex=604800)
+
+    await auth_service.logout(token)
+    assert not await redis_client.exists(f"refresh_token:{user.id}:{jti}")
